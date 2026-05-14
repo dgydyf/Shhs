@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import hashlib
+import asyncio
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
@@ -339,15 +341,8 @@ async def unknown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set!")
-        raise SystemExit(1)
-
-    logger.info("Starting bot...")
-
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-
     post_conv = ConversationHandler(
         entry_points=[CommandHandler("post", post_start)],
         states={
@@ -379,7 +374,6 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_channels))
     app.add_handler(post_conv)
@@ -388,20 +382,61 @@ def main():
     app.add_handler(remove_conv)
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_handler))
+    return app
+
+
+async def health_check(request):
+    return web.Response(text="Bot is running ✅")
+
+
+async def telegram_webhook(request):
+    ptb_app = request.app["ptb_app"]
+    data = await request.json()
+    update = Update.de_json(data, ptb_app.bot)
+    await ptb_app.process_update(update)
+    return web.Response(text="OK")
+
+
+async def run():
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set!")
+        raise SystemExit(1)
+
+    ptb_app = build_app()
+    await ptb_app.initialize()
+    await ptb_app.start()
 
     if WEBHOOK_URL:
-        logger.info(f"Starting webhook mode on port {PORT}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        webhook_path = f"/{BOT_TOKEN}"
+        full_webhook_url = f"{WEBHOOK_URL}{webhook_path}"
+        await ptb_app.bot.set_webhook(
+            url=full_webhook_url,
             drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
         )
+        logger.info(f"Webhook set to: {full_webhook_url}")
+
+        web_app = web.Application()
+        web_app["ptb_app"] = ptb_app
+        web_app.router.add_get("/", health_check)
+        web_app.router.add_get("/health", health_check)
+        web_app.router.add_post(webhook_path, telegram_webhook)
+
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info(f"Server running on port {PORT}")
+
+        await asyncio.Event().wait()
     else:
-        logger.info("Starting polling mode (local)")
-        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        logger.info("No WEBHOOK_URL — starting polling mode")
+        await ptb_app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
